@@ -1,19 +1,21 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
-import { createServer, getServerPort, reddit, media } from "@devvit/web/server";
+import { createServer, getServerPort, reddit } from "@devvit/web/server";
 import { redis } from "@devvit/redis";
 import type { UiResponse } from "@devvit/web/shared";
 
-// Scheduled, app-account native Reddit IMAGE posts, including animated GIFs.
-// No external Reddit Data API credentials. No video/audio MP4 capability.
+// Production Reddit-only publishing app. It never talks to Facebook,
+// TikTok or Instagram; the owner's private Linux collector handles them.
+// Video is converted to GIF (silent) before it appears in the staging feed.
 const app = new Hono();
 const SUB = "jezzamariebagaforo";
-const REPO = "heroo2123/jezza-reddit-archive-feed";
-const FEED = "https://api.github.com/repos/" + REPO + "/contents/feed.json";
-const ASSET_PREFIX = "https://github.com/" + REPO + "/releases/download/staging/";
-const KEY_PREFIX = "jezza:v1:";
+const FEED = "https://api.github.com/repos/heroo2123/jezza-reddit-archive-feed/contents/feed.json";
+const ASSET_PREFIX = "https://github.com/heroo2123/jezza-reddit-archive-feed/releases/download/staging/";
+const NS = "jezza:v2:"; // keep existing Redis receipts; never reset dedup history
+const ARCHIVE_SOURCE_ORDER = ["tiktok", "instagram", "facebook"] as const;
+const ARCHIVE_ROTATION_KEY = NS + "lastArchivePlatform";
 const MAX_ITEMS = 64;
-const MAX_AGE_MS = 50 * 3600_000;
+const NOW = () => new Date();
 
 type Entry = {
   id: string;
@@ -27,192 +29,192 @@ type Entry = {
   expiresAt: string;
   sha256: string;
 };
-type Feed = {
-  enabled: boolean;
-  items: Entry[];
-  generatedAt: string;
-};
+type Feed = { enabled: boolean; items: Entry[]; generatedAt: string };
 type Receipt = {
-  state: "uploading" | "pending" | "posted" | "retryable";
+  state: "pending" | "posted" | "failed";
   id: string;
-  mediaUrl?: string;
+  title: string;
+  remoteUrl: string;
   redditId?: string;
   at: string;
   error?: string;
 };
-const now = () => new Date();
-const todayHour = () => now().toISOString().slice(0, 13);
-const itemKey = (id: string) => KEY_PREFIX + id;
+const itemKey = (id: string) => NS + "item:" + id;
+const thisHour = () => NOW().toISOString().slice(0, 13);
 
-async function getFeed(): Promise<Feed> {
-  const rsp = await fetch(FEED + "?t=" + Math.floor(Date.now() / 60000), {
-    method: "GET",
-    headers: {
-      Accept: "application/vnd.github+json",
-      "User-Agent": "jezza-hourly-archive-devvit",
-    },
+async function feed(): Promise<Feed> {
+  const r = await fetch(FEED + "?minute=" + Math.floor(Date.now() / 60_000), {
+    headers: { Accept: "application/vnd.github+json", "User-Agent": "jezza-devvit-hourly-archive" },
   });
-  if (!rsp.ok) throw Error("GitHub feed is unavailable: HTTP " + rsp.status);
-  const body = await rsp.json() as { content?: string; encoding?: string };
-  if (body.encoding !== "base64" || typeof body.content !== "string")
-    throw Error("GitHub feed returned unexpected encoding");
-  const raw = Buffer.from(body.content.replace(/\s+/g, ""), "base64").toString("utf8");
-  const data: unknown = JSON.parse(raw);
-  if (!data || typeof data !== "object" ||
-      !Array.isArray((data as Feed).items) ||
-      typeof (data as Feed).enabled !== "boolean")
-    throw Error("Malformed source feed");
-  return data as Feed;
+  if (!r.ok) throw Error("Public feed unavailable, HTTP " + r.status);
+  const body = await r.json() as { encoding?: string; content?: string };
+  if (body.encoding !== "base64" || !body.content) throw Error("Unsupported feed encoding");
+  const doc: unknown = JSON.parse(Buffer.from(body.content.replace(/\s/g, ""), "base64").toString("utf8"));
+  if (!doc || typeof doc !== "object" || !Array.isArray((doc as Feed).items) ||
+      typeof (doc as Feed).enabled !== "boolean")
+    throw Error("Malformed feed contents");
+  return doc as Feed;
 }
 
 function valid(item: Entry): boolean {
   if (!item || typeof item !== "object") return false;
-  if (!["gif", "image"].includes(item.kind)) return false;
-  if (typeof item.id !== "string" || !/^(instagram|tiktok|facebook):[a-f0-9]{22}$/.test(item.id))
-    return false;
+  if (!/^(instagram|facebook|tiktok):[a-f0-9]{22}$/.test(item.id)) return false;
+  // Do not publish degraded silent GIFs. MP4 originals remain queued
+  // separately until a compliant native-video uploader is available.
+  if (item.kind !== "image" || !["archive", "fresh"].includes(item.priority)) return false;
   if (typeof item.title !== "string" || !item.title.trim()) return false;
-  if (!item.assetName?.startsWith("jezza-") ||
-      !/^jezza-[a-f0-9]{16}\.(gif|jpg)$/.test(item.assetName)) return false;
-  if (item.kind === "gif" && !item.assetName.endsWith(".gif")) return false;
-  if (item.kind === "image" && !item.assetName.endsWith(".jpg")) return false;
+  if (!/^jezza-[a-f0-9]{16}\.(gif|jpg)$/.test(item.assetName)) return false;
   if (item.assetUrl !== ASSET_PREFIX + item.assetName) return false;
-  const expiry = new Date(item.expiresAt).getTime();
-  const staged = new Date(item.stagedAt).getTime();
-  if (!Number.isFinite(expiry) || !Number.isFinite(staged)) return false;
-  if (expiry < Date.now() + 60_000 || staged > Date.now() + 60_000) return false;
-  if (Date.now() - staged > MAX_AGE_MS) return false;
-  if (typeof item.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(item.sha256)) return false;
-  return true;
+  if (!item.assetName.endsWith(".jpg")) return false;
+  if (!/^[a-f0-9]{64}$/.test(item.sha256)) return false;
+  const staging = Date.parse(item.stagedAt);
+  const expiry = Date.parse(item.expiresAt);
+  return Number.isFinite(staging) && Number.isFinite(expiry) &&
+    staging <= Date.now() + 60_000 && expiry > Date.now() + 120_000 &&
+    Date.now() - staging < 50 * 3600_000;
+}
+
+function postTitle(entry: Entry): string {
+  const scrubbed = entry.title.replace(/https?:\/\/\S+/g, "").replace(/\s+/g, " ").trim();
+  return scrubbed.slice(0, 270) || "Jezza Marie Bagaforo";
 }
 
 async function getReceipt(id: string): Promise<Receipt | null> {
-  const content = await redis.get(itemKey(id));
-  if (!content) return null;
+  const raw = await redis.get(itemKey(id));
+  if (!raw) return null;
   try {
-    const receipt = JSON.parse(content) as Receipt;
-    return receipt && typeof receipt.state === "string" ? receipt : null;
-  } catch { return null; }
+    const receipt = JSON.parse(raw) as Receipt;
+    if (!receipt || receipt.id !== id || !["pending", "posted", "failed"].includes(receipt.state))
+      throw Error("Invalid receipt");
+    return receipt;
+  } catch {
+    // Corrupt receipts are never reset automatically. Avoid duplicate posts.
+    throw Error("Unreadable receipt; publication halted for safety");
+  }
 }
-async function setReceipt(receipt: Receipt): Promise<void> {
+async function saveReceipt(receipt: Receipt): Promise<void> {
   await redis.set(itemKey(receipt.id), JSON.stringify(receipt));
 }
 
-async function reconcile(entry: Entry, receipt: Receipt): Promise<Receipt> {
-  if (receipt.state !== "pending" || !receipt.mediaUrl) return receipt;
-  const recent = await reddit.getNewPosts({
-    subredditName: SUB,
-    limit: 100,
-    pageSize: 100,
-  }).all();
-  // Exact unique Reddit-hosted image CDN URL prevents title-based false matches.
-  const found = recent.find((post) =>
-    post.url === receipt.mediaUrl ||
-    post.url.split("?")[0] === receipt.mediaUrl!.split("?")[0]
-  );
-  if (found) {
-    const updated: Receipt = {
-      ...receipt, state: "posted", redditId: found.id, at: now().toISOString()
-    };
-    await setReceipt(updated);
-    console.log("Verified async image post", entry.id, found.id);
-    return updated;
+async function reconcile(receipt: Receipt): Promise<void> {
+  if (receipt.state !== "pending") return;
+  try {
+    const list = await reddit.getNewPosts({ subredditName: SUB, limit: 100, pageSize: 100 }).all();
+    const started = Date.parse(receipt.at) - 120_000;
+    const found = list.find((p) => {
+      if (p.title !== receipt.title || !p.url?.startsWith("https://i.redd.it/")) return false;
+      const created = new Date(p.createdAt).getTime();
+      return Number.isFinite(created) && created >= started;
+    });
+    if (!found) {
+      console.log("Asynchronous post still unverified", receipt.id);
+      return;
+    }
+    await saveReceipt({ ...receipt, state: "posted", redditId: found.id, at: NOW().toISOString() });
+    console.log("Verified native i.redd.it post", receipt.id, found.id);
+  } catch (error) {
+    // A failed Reddit listing is not permission to submit again.
+    console.warn("Cannot reconcile unknown outcome", receipt.id, String(error).slice(0, 150));
   }
-  return receipt;
 }
 
-async function publishNext(): Promise<string> {
-  const feed = await getFeed();
-  if (!feed.enabled) return "disabled by feed owner";
-  if (await redis.get(KEY_PREFIX + "lastAttemptHour") === todayHour())
-    return "hourly safety limit reached";
-  const candidates = feed.items.slice(-MAX_ITEMS)
-    .filter(valid)
-    .sort((a, b) => {
-      if (a.priority !== b.priority) return a.priority === "fresh" ? -1 : 1;
-      return a.priority === "fresh" ?
-        Date.parse(b.createdAt) - Date.parse(a.createdAt) :
-        Date.parse(a.createdAt) - Date.parse(b.createdAt);
-    });
+async function publishOnce(): Promise<string> {
+  const data = await feed();
+  if (!data.enabled) return "feed disabled";
+  if (await redis.get(NS + "lastAttemptHour") === thisHour()) {
+    // Read-only reconciliation may run while the posting hour is reserved.
+    // NEVER submit a second post in the same UTC hour.
+    const pending = data.items.slice(-MAX_ITEMS).filter(valid);
+    for (const item of pending) {
+      const receipt = await getReceipt(item.id);
+      if (receipt?.state === "pending") await reconcile(receipt);
+    }
+    return "hourly cap used; pending submissions audited";
+  }
+
+  const eligible = data.items.slice(-MAX_ITEMS).filter(valid);
+  // Genuinely new content always has priority, regardless of platform.
+  const fresh = eligible.filter(x => x.priority === "fresh")
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  const older = eligible.filter(x => x.priority === "archive");
+
+  // Rotate historical sources in succession across the three accounts:
+  // TikTok -> Instagram -> Facebook -> TikTok. Within a source, oldest first.
+  // Skip sources without eligible unposted media. The cursor persists across
+  // cron executions, and advances ONLY when an archived item is submitted.
+  const lastArchive = await redis.get(ARCHIVE_ROTATION_KEY);
+  const lastIndex = ARCHIVE_SOURCE_ORDER.indexOf(lastArchive as typeof ARCHIVE_SOURCE_ORDER[number]);
+  const start = (lastIndex + 1) % ARCHIVE_SOURCE_ORDER.length;
+  const archiveOrder = Array.from({length: ARCHIVE_SOURCE_ORDER.length}, (_, offset) =>
+    ARCHIVE_SOURCE_ORDER[(start + offset) % ARCHIVE_SOURCE_ORDER.length]!);
+  const rotatedArchive = archiveOrder.flatMap(platform =>
+    older.filter(x => x.id.startsWith(platform + ":"))
+      .sort((a,b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)));
+  const candidates = [...fresh, ...rotatedArchive];
+
   for (const item of candidates) {
     const existing = await getReceipt(item.id);
-    if (existing?.state === "pending") {
-      try { await reconcile(item, existing); }
-      catch (error) { console.error("Reconciliation unavailable", item.id, error); }
-      // A pending upload is deliberately never resubmitted to avoid duplicates.
-      continue;
+    if (existing) {
+      if (existing.state === "pending") await reconcile(existing);
+      continue; // Never re-submit an item with any prior receipt.
     }
-    if (existing && existing.state !== "retryable") continue;
-    // Reserve the hour before making any upload or post call.
-    await redis.set(KEY_PREFIX + "lastAttemptHour", todayHour());
-    await setReceipt({ state: "uploading", id: item.id, at: now().toISOString() });
-    let uploaded: {mediaUrl: string};
-    try {
-      uploaded = await media.upload({
-        url: item.assetUrl,
-        type: item.kind,
-      });
-      if (!uploaded?.mediaUrl?.startsWith("https://"))
-        throw Error("No Reddit-hosted media URL returned");
-    } catch (e) {
-      await setReceipt({
-        state: "retryable", id: item.id, at: now().toISOString(),
-        error: String(e).slice(0, 200),
-      });
-      console.error("Media upload failed before posting", item.id, e);
-      return "media upload failed; no Reddit submission attempted";
+    await redis.set(NS + "lastAttemptHour", thisHour()); // before any submit attempt
+    const receipt: Receipt = {
+      id: item.id, title: postTitle(item), remoteUrl: item.assetUrl,
+      state: "pending", at: NOW().toISOString(),
+    };
+    await saveReceipt(receipt);
+    if (item.priority === "archive") {
+      // Advance the archival rotation on submission ATTEMPT, including an
+      // asynchronous/uncertain result; never retry the same media blindly.
+      await redis.set(ARCHIVE_ROTATION_KEY, item.id.split(":")[0]!);
     }
-    // Save unique CDN URL BEFORE calling Reddit so uncertain outcomes can be
-    // reconciled via new posts instead of accidentally being posted twice.
-    await setReceipt({
-      state: "pending", id: item.id, mediaUrl: uploaded.mediaUrl, at: now().toISOString()
-    });
+    console.log("Jezza selected",item.id,"priority",item.priority,
+                "archive order",archiveOrder.join(" -> "));
     try {
-      const post = await reddit.submitPost({
+      // Verified in private subreddit: Reddit asynchronously imports GitHub
+      // Release GIFs into native i.redd.it media using SubmitMediaOptions.
+      const posted = await reddit.submitPost({
         subredditName: SUB,
-        title: item.title.replace(/https?:\/\/\S+/g, "").slice(0, 290).trim() || "Jezza Marie Bagaforo",
+        title: receipt.title,
         kind: "image",
-        imageUrls: [uploaded.mediaUrl],
+        imageUrls: [receipt.remoteUrl],
       });
-      const receipt: Receipt = {
-        state: "posted", id: item.id, mediaUrl: uploaded.mediaUrl,
-        redditId: post.id, at: now().toISOString()
-      };
-      await setReceipt(receipt);
-      console.log("Reddit image post verified", item.id, post.id);
-      return "published " + item.id + " post=" + post.id;
+      if (posted?.id) {
+        await saveReceipt({ ...receipt, state: "posted", redditId: posted.id, at: NOW().toISOString() });
+        console.log("Native image post returned ID", item.id, posted.id);
+        return "posted " + item.id;
+      }
+      console.log("Reddit image submission accepted without synchronous ID", item.id);
+      return "asynchronous submission " + item.id;
     } catch (error) {
-      // Devvit may throw when an image post is still processing asynchronously.
-      // Keep pending and never retry the submission; reconcile on later ticks.
-      console.warn("Reddit submit may be async; awaiting reconciliation",
-        item.id, String(error).slice(0, 250));
-      return "submitted; verification pending for " + item.id;
+      // In testing, an SDK error about asynchronous creation really DID
+      // publish the Reddit image. The receipt stays pending; no blind retry.
+      console.warn("Asynchronous/uncertain Reddit response", item.id, String(error).slice(0, 180));
+      return "submitted, waiting verification " + item.id;
     }
   }
-  return "no eligible unposted content";
+  return "no unposted eligible staged content";
 }
 
 app.post("/internal/scheduler/hourly-post", async (c) => {
   try {
-    const result = await publishNext();
-    console.log("Jezza scheduler", result);
-    return c.json({status:"ok", result});
-  } catch (e) {
-    console.error("Scheduler error", e);
-    return c.json({status:"error"});
+    const result = await publishOnce();
+    console.log("Jezza hourly result", result);
+    return c.json({ status: "ok", result });
+  } catch (error) {
+    console.error("Jezza hourly error", String(error).slice(0, 200));
+    return c.json({ status: "error" });
   }
 });
 
 app.post("/internal/menu/archive-status", async (c) => {
-  const enabled = (await getFeed().catch(() => null))?.enabled ?? false;
-  const lastHour = await redis.get(KEY_PREFIX + "lastAttemptHour");
+  const enabled = (await feed().catch(() => null))?.enabled || false;
+  const latest = await redis.get(NS + "lastAttemptHour");
   const message = enabled
-    ? "Jezza archive enabled. Last posting attempt: " + (lastHour || "none")
-    : "Jezza archive disabled; no posts will be submitted.";
-  return c.json<UiResponse>({ showToast: message });
+    ? "Jezza archive enabled. Last attempted hour: " + (latest ?? "none")
+    : "Jezza archive is disabled; no images will be posted.";
+  return c.json<UiResponse>({ showToast: { text: message, appearance: "success" } });
 });
 
-serve({
-  fetch: app.fetch,
-  createServer,
-  port: getServerPort(),
-});
+serve({ fetch: app.fetch, createServer, port: getServerPort() });

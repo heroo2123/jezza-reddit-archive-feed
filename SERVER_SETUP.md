@@ -1,20 +1,14 @@
-# Source-side helpers (alpha-dev)
+# Alpha-dev source-side automation
 
-These scripts are included for auditability. They are already running from
-`/home/alphaadmin/jezza-reddit-mirror` on the owner's server.
+The production code running on alpha-dev is under /home/alphaadmin/jezza-reddit-mirror/.
 
-- `server-free-mirror.py`: source metadata collection with a local Apify free-tier
-  cap, TikTok fallback, and media conversion helpers.
-- `server-github-stage.py`: publishes one short-lived optimized JPEG/GIF to the
-  public staging release, updates the disabled-by-default feed and cleans up.
+- server-free-mirror.py collects public source metadata and retains source links, captions, and fingerprints.
+- server-github-stage.py stages one native photo at a time and cleans temporary downloads, with no silent GIF conversion.
+- Devvit app in devvit-app handles one native photo per hour maximum in r/jezzamariebagaforo.
+- Historical photo sources rotate TikTok, Instagram, Facebook. New photos from any source win.
+- Video records remain in the queue for a future authorized MP4 uploader; no audio or source video is deliberately discarded.
+- Free Apify usage includes a hard local cap. Never deploy passwords, session cookies, tokens, local SQLite files, or private environment files to GitHub.
 
-Do not place Reddit tokens, Apify tokens, GitHub tokens, `.env.free`, cookie
-storage or SQLite database files in this GitHub repository.
+The code can support higher-quality original MP4 output only when Reddit permits native video uploading via an authorized API; Devvit's current media capability supports still images and animated GIFs, not MP4 with audio.
 
-To finish installation, the owner must authorize Devvit CLI, create the Devvit
-app under Reddit's Developer Portal, install it to the subreddit and test one
-image + one GIF. The feed must remain disabled until those tests pass.
-
-The GitHub release is only temporary transport: local downloaded media is
-never retained after staging and expired release assets are cleaned every six
-hours. Free GitHub release staging is best-effort and subject to fair-use limits.
+The public GitHub release is temporary transport, not permanent local storage. Expired release assets are removed by periodic cleanup.

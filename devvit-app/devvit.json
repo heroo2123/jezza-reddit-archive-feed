@@ -1,9 +1,20 @@
 {
   "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
   "name": "jezza-hourly-archive",
-  "server": {
-    "dir": "dist/server",
-    "entry": "index.cjs"
+  "server": {},
+  "menu": {
+    "items": [
+      {
+        "label": "Jezza archive status",
+        "description": "Check if scheduled archive posting is enabled",
+        "location": "subreddit",
+        "endpoint": "/internal/menu/archive-status",
+        "forUserType": "moderator"
+      }
+    ]
+  },
+  "scripts": {
+    "dev": "npm run watch"
   },
   "permissions": {
     "reddit": {
@@ -27,19 +38,7 @@
       }
     }
   },
-  "menu": {
-    "items": [
-      {
-        "label": "Jezza archive status",
-        "description": "Check if scheduled archive posting is enabled",
-        "location": "subreddit",
-        "endpoint": "/internal/menu/archive-status",
-        "forUserType": "moderator"
-      }
-    ]
-  },
-  "scripts": {
-    "build": "npm run build",
-    "dev": "npm run dev"
+  "dev": {
+    "subreddit": "jezza_hourly_arch_dev"
   }
 }

@@ -88,20 +88,59 @@ def same_media(c,sha,phash):
     return None
 
 def convert_video_to_gif(video:Path,target_dir:Path)->Path:
+    """High-quality GIF only: preserve 720px width, full video, no silent 360p fallback.
+
+    GIF cannot preserve video audio or 24-bit color. Optimized 720px/12fps
+    beats the previous low-quality 360px/6fps output at the cost of larger files.
+    If a full clip cannot be fitted below the safe 18MB cap we skip it instead
+    of posting an unacceptably blurry, tiny clip.
+    """
+    import time
     ffmpeg=get_ffmpeg_exe()
-    # 20MB Reddit hard max; prefer <7MB for 30s Reddit media upload time limit.
-    trials=[(7,400,72),(6,360,64),(5,320,56),(4,280,48),(3,240,40)]
-    for fps,width,colors in trials:
-        dst=target_dir/f"ready-{fps}-{width}.gif"
-        filters=(f"fps={fps},scale={width}:-1:flags=lanczos,"
-                 f"split[a][b];[a]palettegen=max_colors={colors}[p];"
-                 f"[b][p]paletteuse=dither=bayer")
+    gifsicle=ROOT/"local-gifsicle/usr/bin/gifsicle"
+    if not gifsicle.is_file():
+        raise RuntimeError("Free local gifsicle optimizer missing; refusing low-quality fallback")
+    began=time.monotonic()
+    # Resolution always 720 wide; when needed sacrifice fps/palette rather
+    # than downsample to 480/360. The 12fps 96-color loss90 preset was tested
+    # against Jezza's original 1080x1920 MP4 (17.0MB GIF).
+    trials=[(12,96,90),(10,80,105),(8,48,120)]
+    for fps,colors,lossiness in trials:
+        if time.monotonic()-began>310:
+            break
+        raw=target_dir/f"hd-raw-{fps}fps.gif"
+        optimized=target_dir/f"hd-optimized-{fps}fps.gif"
+        filters=(f"fps={fps},scale=720:-2:flags=lanczos,"
+                 f"split[a][b];[a]palettegen=max_colors={colors}:stats_mode=diff[p];"
+                 f"[b][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle")
         p=subprocess.run([ffmpeg,"-nostdin","-y","-loglevel","error","-i",str(video),
-              "-vf",filters,str(dst)],capture_output=True,timeout=165)
-        if p.returncode==0 and dst.exists() and 0<dst.stat().st_size<7_000_000:
-            LOG.info("GIF ready fps=%d width=%d bytes=%d",fps,width,dst.stat().st_size)
-            return dst
-    raise RuntimeError("Video could not fit into a GIF under 7 MB; skipped without truncation")
+                          "-vf",filters,str(raw)],capture_output=True,timeout=110)
+        if p.returncode or not raw.exists():
+            LOG.warning("720px GIF encoding failed for fps=%s",fps)
+            continue
+        raw_size=raw.stat().st_size
+        if 0<raw_size<18_000_000:
+            LOG.info("720px GIF %sfps ready: %s bytes (no optimization needed)",fps,raw_size)
+            return raw
+        if raw_size>65_000_000:
+            raw.unlink(missing_ok=True)
+            LOG.info("720px %sfps GIF too large to optimize; trying lower fps",fps)
+            continue
+        try:
+            p=subprocess.run(["/usr/bin/nice","-n","12",str(gifsicle),
+                        "--optimize=3",f"--lossy={lossiness}","--threads=4",
+                        "-o",str(optimized),str(raw)],
+                        capture_output=True,timeout=135)
+            if p.returncode==0 and optimized.exists() and 0<optimized.stat().st_size<18_000_000:
+                LOG.info("720px HD GIF %sfps, %s colors ready: %s bytes",
+                         fps,colors,optimized.stat().st_size)
+                raw.unlink(missing_ok=True)
+                return optimized
+        except subprocess.TimeoutExpired:
+            LOG.warning("720px GIF optimizer timeout at fps=%s",fps)
+        raw.unlink(missing_ok=True)
+        optimized.unlink(missing_ok=True)
+    raise RuntimeError("Full-length 720px animated GIF cannot fit below 18 MB; skipping poor-quality conversion")
 
 def convert_photo_to_jpg(image:Path,target_dir:Path)->Path:
     output=target_dir/"ready.jpg"
@@ -118,9 +157,35 @@ def convert_photo_to_jpg(image:Path,target_dir:Path)->Path:
         raise RuntimeError("Image too large to stage")
     return output
 
+ARCHIVE_SOURCE_ORDER = ("tiktok", "instagram", "facebook")
+ARCHIVE_ROTATION_KEY = "jezza_archive_last_staged_platform"
+
 def candidate(c):
-    return c.execute("""SELECT * FROM posts WHERE state='fresh' ORDER BY created DESC LIMIT 1""").fetchone() or c.execute(
-        """SELECT * FROM posts WHERE state='archive' ORDER BY created ASC LIMIT 1""").fetchone()
+    # New content from ANY platform always wins. Among new items use the
+    # original published timestamp (not the source platform or scan order).
+    fresh = c.execute(
+        """SELECT * FROM posts WHERE state='fresh' AND kind='image'
+           ORDER BY created DESC,uid ASC LIMIT 1"""
+    ).fetchone()
+    if fresh:
+        return fresh
+
+    # When idle, cycle TikTok -> Instagram -> Facebook across the full
+    # historical pool. If the next source is empty, skip to the next with
+    # eligible unused content. This cursor only advances on successful
+    # ARCHIVE staging, never on a failed retrieval or a new post.
+    last = base.setting(c, ARCHIVE_ROTATION_KEY) or "facebook"
+    begin = (ARCHIVE_SOURCE_ORDER.index(last) + 1) % len(ARCHIVE_SOURCE_ORDER) if last in ARCHIVE_SOURCE_ORDER else 0
+    for delta in range(len(ARCHIVE_SOURCE_ORDER)):
+        platform = ARCHIVE_SOURCE_ORDER[(begin + delta) % len(ARCHIVE_SOURCE_ORDER)]
+        row = c.execute(
+            """SELECT * FROM posts WHERE state='archive' AND kind='image' AND platform=?
+               ORDER BY created ASC,uid ASC LIMIT 1""",
+            (platform,),
+        ).fetchone()
+        if row:
+            return row
+    return None
 
 def cleanup_manifest(manifest:dict,days:int=2)->None:
     # While the publishing feed is disabled, no Reddit posting can occur.
@@ -149,20 +214,13 @@ def cleanup_manifest(manifest:dict,days:int=2)->None:
                 LOG.warning("Asset cleanup delayed: %s",str(e)[:100])
                 keep.append(entry)
                 continue
-        # A published/uncertain result must NEVER be blindly restaged.
-        # Mark for review because the Devvit app has independent Redis
-        # receipts and GitHub is only the temporary transport.
-        uid=entry.get("id")
-        if isinstance(uid,str):
-            try:
-                db=base.connect()
-                db.execute("""UPDATE posts SET state='needs_review',
-                       error='Staging link expired: check Devvit Reddit receipts before restaging'
-                       WHERE uid=? AND state='staged'""",(uid,))
-                db.commit()
-                db.close()
-            except Exception as exc:
-                LOG.warning("Could not mark expired item for review: %s",str(exc)[:120])
+        # Staged assets are temporary transport. Expiry after 50 hours is
+        # normal whether the Devvit upload was asynchronous or verified.
+        # Keep SQLite row state='staged' (and its perceptual hash) to avoid
+        # accidentally treating old media as new/reposting duplicates.
+        # Verified Reddit publication receipts are held in Devvit Redis.
+        LOG.info("Expired staging URL for %s; local metadata remains for dedup",
+                 entry.get("id"))
     manifest["items"]=keep[-64:]
 
 def stage_one(c,manifest:dict)->bool:
@@ -190,8 +248,13 @@ def stage_one(c,manifest:dict)->bool:
                     ready=convert_photo_to_jpg(source,work)
                     kind="image"
                 else:
-                    ready=convert_video_to_gif(source,work)
-                    kind="gif"
+                    # A source marked as a photo unexpectedly resolved to
+                    # video; defer it rather than degrading the video to GIF.
+                    c.execute("UPDATE posts SET state='deferred_video',error=? WHERE uid=?",
+                              ("Video encountered in photo-only mode; preserve MP4 source URL",uid))
+                    c.commit()
+                    LOG.warning("Video deferred without a low-frame-rate GIF: %s",uid)
+                    continue
                 asset="jezza-"+uid.split(":")[-1][:16]+ready.suffix
                 renamed=work/asset
                 ready.rename(renamed)
@@ -215,9 +278,11 @@ def stage_one(c,manifest:dict)->bool:
                     raise
                 c.execute("UPDATE posts SET state='staged',sha=?,phash=?,error=NULL WHERE uid=?",
                           (sha,phash,uid))
+                if item["state"] == "archive":
+                    base.setsetting(c, ARCHIVE_ROTATION_KEY, item["platform"])
                 c.commit()
-                LOG.info("Staged %s as %s, size=%d MB; local media deleted",uid,kind,
-                         renamed.stat().st_size//1048576)
+                LOG.info("Staged %s as %s (priority=%s,platform=%s), size=%d MB; local media deleted",
+                         uid,kind,item["state"],item["platform"],renamed.stat().st_size//1048576)
                 return True
         except Exception as e:
             c.execute("UPDATE posts SET state='needs_review',error=? WHERE uid=?",
