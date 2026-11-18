@@ -1,0 +1,19 @@
+{
+  "dependencies": {
+    "@devvit/reddit": "^0.15.4",
+    "@devvit/redis": "^0.15.4",
+    "@devvit/web": "^0.15.4",
+    "@hono/node-server": "^2.1.9",
+    "devvit": "^0.15.4",
+    "hono": "^4.13.19"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "build": "esbuild src/server/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/server/index.cjs",
+    "dev": "esbuild src/server/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/server/index.cjs --watch"
+  }
+}
