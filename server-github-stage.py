@@ -123,6 +123,12 @@ def candidate(c):
         """SELECT * FROM posts WHERE state='archive' ORDER BY created ASC LIMIT 1""").fetchone()
 
 def cleanup_manifest(manifest:dict,days:int=2)->None:
+    # While the publishing feed is disabled, no Reddit posting can occur.
+    # Retain already-staged assets until the application is ready, rather
+    # than silently dropping them during the Reddit developer onboarding.
+    if not manifest.get("enabled", False):
+        LOG.info("Publishing feed disabled; staged assets retained until activation")
+        return
     now=dt.datetime.now(dt.timezone.utc)
     keep=[]
     for entry in manifest.get("items",[]):
@@ -141,6 +147,22 @@ def cleanup_manifest(manifest:dict,days:int=2)->None:
                 LOG.info("Removed expired public staging asset: %s",asset)
             except RuntimeError as e:
                 LOG.warning("Asset cleanup delayed: %s",str(e)[:100])
+                keep.append(entry)
+                continue
+        # A published/uncertain result must NEVER be blindly restaged.
+        # Mark for review because the Devvit app has independent Redis
+        # receipts and GitHub is only the temporary transport.
+        uid=entry.get("id")
+        if isinstance(uid,str):
+            try:
+                db=base.connect()
+                db.execute("""UPDATE posts SET state='needs_review',
+                       error='Staging link expired: check Devvit Reddit receipts before restaging'
+                       WHERE uid=? AND state='staged'""",(uid,))
+                db.commit()
+                db.close()
+            except Exception as exc:
+                LOG.warning("Could not mark expired item for review: %s",str(exc)[:120])
     manifest["items"]=keep[-64:]
 
 def stage_one(c,manifest:dict)->bool:
@@ -213,6 +235,14 @@ def main():
     manifest=get_manifest()
     if args.enable_feed:
         manifest["enabled"]=args.enable_feed=="yes"
+        # Reset staged URL TTL only on first activation; activation itself
+        # must follow a verified Reddit app install and fetch approval.
+        if manifest["enabled"]:
+            stamp=base.now()
+            expiry=(dt.datetime.now(dt.timezone.utc)+dt.timedelta(hours=50)).isoformat()
+            for entry in manifest["items"]:
+                entry["stagedAt"]=stamp
+                entry["expiresAt"]=expiry
         put_manifest(manifest)
         LOG.info("GitHub feed enabled=%s; does not publish directly to Reddit",manifest["enabled"])
         return
